@@ -1,0 +1,4 @@
+aiogram==3.26.0
+python-dotenv==1.1.1
+spotipy==2.25.1
+yt-dlp==2026.9.26
