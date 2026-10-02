@@ -4,6 +4,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 import yt_dlp
+import yt_dlp.utils
 
 LYRICS_API = "https://lrclib.net/api/get"
 
@@ -76,6 +77,27 @@ def tag_mp3(path, track, cover_bytes=b"", lyrics=""):
         pass
 
 
+def _pick_by_duration(entries, target_sec, tolerance=90):
+    """Pick the entry whose duration is closest to target within tolerance."""
+    best = None
+    best_diff = None
+    for e in entries or []:
+        d = e.get("duration") if isinstance(e, dict) else None
+        if not d:
+            continue
+        diff = abs(d - target_sec)
+        if diff <= tolerance and (best_diff is None or diff < best_diff):
+            best, best_diff = e, diff
+    if best is not None:
+        return best
+    # no duration info at all — fall back to first entry
+    if entries and all(
+            not (isinstance(e, dict) and e.get("duration"))
+            for e in entries):
+        return entries[0]
+    return None
+
+
 class AudioDownloader:
     def __init__(self, download_dir, max_file_size_mb, cookiefile=None):
         self.download_dir = Path(download_dir)
@@ -85,7 +107,6 @@ class AudioDownloader:
         if cookiefile:
             cand = Path(cookiefile)
             if not cand.is_absolute():
-                # try CWD first (repo root), then download dir
                 if (Path.cwd() / cand).is_file():
                     cand = Path.cwd() / cand
                 else:
@@ -104,25 +125,13 @@ class AudioDownloader:
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled("cancelled by user")
 
-    def _download(self, track, quality, cancel_event, with_cover, with_lyrics):
-        self._check_cancel(cancel_event)
-        # Unique job dir — two users grabbing the same track never collide.
-        job_dir = self.download_dir / f"job-{uuid.uuid4().hex[:12]}"
-        job_dir.mkdir(parents=True, exist_ok=True)
-        stem = safe_name(f"{track.artist_text} - {track.title}")
-        outtmpl = str(job_dir / f"{stem}.%(ext)s")
-
-        def progress_hook(d):
-            if cancel_event is not None and cancel_event.is_set():
-                raise Cancelled("cancelled by user")
-
-        options = {
+    def _base_options(self, outtmpl, quality, progress_hook):
+        return {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "default_search": "ytsearch1",
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -134,41 +143,119 @@ class AudioDownloader:
             "fragment_retries": 3,
             "progress_hooks": [progress_hook],
         }
+
+    def _download_url(self, options, url, progress_hook):
+        """Download one resolved URL with given options. Returns mp3 Path."""
+        options = dict(options)
+        options["progress_hooks"] = [progress_hook]
+        with yt_dlp.YoutubeDL(options) as ydl:
+            entry = ydl.extract_info(url, download=True)
+            output = Path(ydl.prepare_filename(entry)).with_suffix(".mp3")
+            if not output.exists():
+                matches = list(Path(output).parent.glob("*.mp3"))
+                if not matches:
+                    raise DownloadError("MP3 was not produced")
+                output = max(matches, key=lambda p: p.stat().st_mtime)
+            if output.stat().st_size > self.max_bytes:
+                output.unlink(missing_ok=True)
+                raise DownloadError("File is too large")
+            return output
+
+    def _search_candidates(self, options, query, target_sec):
+        """Search (no download); return up to 3 candidate webpage URLs
+        ordered by duration closeness."""
+        options = dict(options)
+        options["quiet"] = True
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(query, download=False)
+        raw = info.get("entries") if isinstance(info, dict) else None
+        entries = []
+        if raw:
+            count = 0
+            it = iter(raw)  # type: ignore[arg-type]
+            while count < 5:
+                try:
+                    entries.append(next(it))
+                except StopIteration:
+                    break
+                count += 1
+        cands = []
+        for e in entries[:5]:
+            if not isinstance(e, dict):
+                continue
+            d = e.get("duration")
+            page = e.get("webpage_url")
+            if not page:
+                continue
+            diff = abs(d - target_sec) if d else 10 ** 9
+            cands.append((diff, page))
+        cands.sort(key=lambda x: x[0])
+        return [p for diff, p in cands if diff <= 90]
+
+    def _download(self, track, quality, cancel_event, with_cover, with_lyrics):
+        self._check_cancel(cancel_event)
+        job_dir = self.download_dir / f"job-{uuid.uuid4().hex[:12]}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        stem = safe_name(f"{track.artist_text} - {track.title}")
+        outtmpl = str(job_dir / f"{stem}.%(ext)s")
+        target_sec = track.duration_ms / 1000
+
+        def progress_hook(d):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled("cancelled by user")
+
+        base = self._base_options(outtmpl, quality, progress_hook)
+        errors = []
+
+        # 1) YouTube search (with cookies when available)
+        yt_opts = dict(base)
+        yt_opts["default_search"] = "ytsearch1"
         if self.cookiefile:
-            options["cookiefile"] = self.cookiefile
-
+            yt_opts["cookiefile"] = self.cookiefile
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{track.search_query}", download=True)
-                entries = info.get("entries") if info else None
-                entry = entries[0] if entries else info
-                if not entry:
-                    raise DownloadError("No result found")
+            pages = self._search_candidates(
+                yt_opts, f"ytsearch1:{track.search_query}", target_sec)
+            if not pages:
+                raise DownloadError("No YouTube match within duration")
+            output = self._download_url(yt_opts, pages[0], progress_hook)
+            import logging as _lg
+            _lg.getLogger(__name__).info("source=youtube page=%s", pages[0])
+        except (Cancelled, DownloadError) as e:
+            if isinstance(e, Cancelled):
+                raise
+            errors.append(f"youtube: {e}")
+            output = None
+        except Exception as e:
+            errors.append(f"youtube: {e}")
+            output = None
 
-                source_duration = entry.get("duration")
-                target_duration = track.duration_ms / 1000
-                if source_duration and abs(source_duration - target_duration) > 90:
-                    raise DownloadError("Matched source duration differs too much")
+        # 2) SoundCloud fallback (no login needed, datacenter-friendly)
+        if output is None:
+            sc_opts = dict(base)
+            sc_opts["default_search"] = "scsearch1"
+            try:
+                pages = self._search_candidates(
+                    sc_opts,
+                    f"scsearch1:{track.artist_text} {track.title}",
+                    target_sec)
+                if not pages:
+                    raise DownloadError("No SoundCloud match within duration")
+                output = self._download_url(sc_opts, pages[0], progress_hook)
+                import logging as _lg2
+                _lg2.getLogger(__name__).info(
+                    "source=soundcloud page=%s", pages[0])
+            except Cancelled:
+                raise
+            except DownloadError as e:
+                raise DownloadError(
+                    "نتونستم نسخه صوتی پیدا کنم (" +
+                    "; ".join(errors + [f"soundcloud: {e}"]) + ")")
+            except Exception as e:
+                raise DownloadError(
+                    f"نتونستم نسخه صوتی پیدا کنم ({errors}; sc: {e})")
 
-                output = Path(ydl.prepare_filename(entry)).with_suffix(".mp3")
-                if not output.exists():
-                    matches = list(job_dir.glob("*.mp3"))
-                    if not matches:
-                        raise DownloadError("MP3 was not produced")
-                    output = max(matches, key=lambda p: p.stat().st_mtime)
-
-                if output.stat().st_size > self.max_bytes:
-                    output.unlink(missing_ok=True)
-                    raise DownloadError("File is too large")
-
-                cover = fetch_bytes(track.cover_url) if with_cover else b""
-                lyrics = fetch_lyrics(track.artists[0] if track.artists else "",
-                                      track.title) if with_lyrics else ""
-                tag_mp3(output, track, cover, lyrics)
-                return output, lyrics
-        except Cancelled:
-            raise
-        except DownloadError:
-            raise
-        except Exception as exc:
-            raise DownloadError(str(exc)) from exc
+        cover = fetch_bytes(track.cover_url) if with_cover else b""
+        lyrics = fetch_lyrics(track.artists[0] if track.artists else "",
+                              track.title) if with_lyrics else ""
+        tag_mp3(output, track, cover, lyrics)
+        return output, lyrics
