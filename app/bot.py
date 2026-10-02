@@ -77,6 +77,7 @@ class SpotifyBot:
         self.downloader = AudioDownloader(
             settings.download_dir,
             settings.max_file_size_mb,
+            settings.cookiefile,
         )
         self.history = History(
             str(Path(settings.download_dir) / "history.db"))
@@ -279,7 +280,7 @@ class SpotifyBot:
             try:
                 async with self.global_semaphore:
                     await self.bot.send_chat_action(
-                        message.chat.id, ChatAction.UPLOAD_AUDIO)
+                        message.chat.id, ChatAction.UPLOAD_VOICE)
                     path, lyrics = await self.downloader.download(
                         track, quality, cancel_ev)
                 await status.edit_text("📤 فایل آماده‌ست؛ دارم می‌فرستم...")

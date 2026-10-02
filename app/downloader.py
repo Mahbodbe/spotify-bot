@@ -77,10 +77,21 @@ def tag_mp3(path, track, cover_bytes=b"", lyrics=""):
 
 
 class AudioDownloader:
-    def __init__(self, download_dir, max_file_size_mb):
+    def __init__(self, download_dir, max_file_size_mb, cookiefile=None):
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_file_size_mb * 1024 * 1024
+        self.cookiefile = None
+        if cookiefile:
+            cand = Path(cookiefile)
+            if not cand.is_absolute():
+                # try CWD first (repo root), then download dir
+                if (Path.cwd() / cand).is_file():
+                    cand = Path.cwd() / cand
+                else:
+                    cand = self.download_dir / cand
+            if cand.is_file():
+                self.cookiefile = str(cand)
 
     async def download(self, track, quality=192, cancel_event=None,
                        with_cover=True, with_lyrics=True):
@@ -123,6 +134,8 @@ class AudioDownloader:
             "fragment_retries": 3,
             "progress_hooks": [progress_hook],
         }
+        if self.cookiefile:
+            options["cookiefile"] = self.cookiefile
 
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
