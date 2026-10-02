@@ -13,6 +13,7 @@ class Settings:
     max_file_size_mb: int
     default_quality: int
     max_playlist_tracks: int
+    cookiefile: str
 
     @classmethod
     def from_env(cls):
@@ -35,4 +36,5 @@ class Settings:
             max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "45")),
             default_quality=quality,
             max_playlist_tracks=int(os.getenv("MAX_PLAYLIST_TRACKS", "30")),
+            cookiefile=os.getenv("YT_COOKIEFILE", ".cookies-yt"),
         )

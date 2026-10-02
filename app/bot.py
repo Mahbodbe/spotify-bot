@@ -77,6 +77,7 @@ class SpotifyBot:
         self.downloader = AudioDownloader(
             settings.download_dir,
             settings.max_file_size_mb,
+            settings.cookiefile,
         )
         self.history = History(
             str(Path(settings.download_dir) / "history.db"))
