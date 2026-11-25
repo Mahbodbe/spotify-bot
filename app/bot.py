@@ -7,7 +7,8 @@ import zipfile
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatAction
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -18,9 +19,9 @@ from aiogram.types import (
 )
 
 from .config import Settings
-from .downloader import AudioDownloader, Cancelled, DownloadError
+from .downloader import AudioDownloader, Cancelled, DownloadError, safe_name
 from .history import History
-from .spotify import SpotifyService
+from .spotify import SpotifyService, extract_first_url, resolve_short_url
 
 log = logging.getLogger(__name__)
 
@@ -65,10 +66,18 @@ def fmt_duration(ms):
     return f"{s // 60}:{s % 60:02d}"
 
 
+def track_caption(track, suffix=""):
+    base = f"🎵 {html.escape(track.title)}\n👤 {html.escape(track.artist_text)}{suffix}"
+    return base[:MAX_CAPTION]
+
+
 class SpotifyBot:
     def __init__(self, settings):
         self.settings = settings
-        self.bot = Bot(settings.bot_token)
+        self.bot = Bot(
+            settings.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
         self.dp = Dispatcher()
         self.spotify = SpotifyService(
             settings.spotify_client_id,
@@ -178,7 +187,7 @@ class SpotifyBot:
     async def on_search_pick(self, query: CallbackQuery):
         await query.answer()
         tid = (query.data or "")[2:]
-        tracks = self.pending_search.get(query.from_user.id, {})
+        tracks = self.pending_search.pop(query.from_user.id, {})
         track = tracks.get(tid)
         if not track:
             try:
@@ -191,8 +200,7 @@ class SpotifyBot:
             await query.message.delete()
         except Exception:
             pass
-        fake = query.message
-        await self._send_track(fake, track, query.from_user.id)
+        await self._send_track(query.message, track, query.from_user.id)
 
     async def on_collection(self, query: CallbackQuery):
         await query.answer()
@@ -217,11 +225,20 @@ class SpotifyBot:
 
     # -- main text handler --
     async def handle_text(self, message: Message):
-        url = (message.text or "").strip()
+        raw = (message.text or "").strip()
         user_id = self._uid(message)
+        url = extract_first_url(raw)
+
+        if self.spotify.is_short_url(url):
+            url = await asyncio.to_thread(resolve_short_url, url)
 
         if self.spotify.extract_track_id(url):
-            track = await asyncio.to_thread(self.spotify.get_track, url)
+            try:
+                track = await asyncio.to_thread(self.spotify.get_track, url)
+            except Exception:
+                log.exception("Spotify track fetch failed")
+                await message.answer("⚠️ نتونستم اطلاعات آهنگ رو از اسپاتیفای بگیرم.")
+                return
             if not track:
                 await message.answer("❌ اطلاعات آهنگ پیدا نشد.")
                 return
@@ -236,7 +253,7 @@ class SpotifyBot:
         status = await message.answer("🔎 دارم سرچ می‌کنم...")
         try:
             tracks = await asyncio.to_thread(
-                self.spotify.search_tracks, url, 5)
+                self.spotify.search_tracks, raw, 5)
         except Exception:
             log.exception("Spotify search failed")
             await status.edit_text("⚠️ سرچ به مشکل خورد؛ دوباره امتحان کن.")
@@ -260,7 +277,7 @@ class SpotifyBot:
         if cached and cached["quality"] == quality:
             await message.answer_audio(
                 audio=cached["file_id"],
-                caption=f"🎵 {track.title}\n👤 {track.artist_text} (از حافظه ⚡)",
+                caption=track_caption(track, " (از حافظه ⚡)"),
             )
             return
 
@@ -284,12 +301,11 @@ class SpotifyBot:
                     path, lyrics = await self.downloader.download(
                         track, quality, cancel_ev)
                 await status.edit_text("📤 فایل آماده‌ست؛ دارم می‌فرستم...")
-                caption = f"🎵 {track.title}\n👤 {track.artist_text}"
                 sent = await message.answer_audio(
                     FSInputFile(path),
                     title=track.title,
                     performer=track.artist_text,
-                    caption=caption[:MAX_CAPTION],
+                    caption=track_caption(track),
                 )
                 if sent.audio:
                     self.history.save(
@@ -299,12 +315,12 @@ class SpotifyBot:
                 await status.delete()
                 if lyrics:
                     await message.answer(
-                        f"📝 متن آهنگ:\n\n{lyrics[:3500]}")
+                        f"📝 متن آهنگ:\n\n{html.escape(lyrics[:3500])}")
             except Cancelled:
                 await status.edit_text("❌ لغو شد.")
-            except DownloadError:
-                log.warning("Could not download Spotify track: %s",
-                            track.url)
+            except DownloadError as e:
+                log.warning("Could not download Spotify track %s: %s",
+                            track.url, e)
                 await status.edit_text(
                     "❌ نتونستم یک نسخه صوتی قابل‌اعتماد برای این آهنگ پیدا کنم.\n"
                     "ممکنه منبع عمومی مناسب پیدا نشه یا فایل بیش از حد بزرگ باشه."
@@ -328,7 +344,10 @@ class SpotifyBot:
                 self.spotify.get_collection, url)
         except Exception:
             log.exception("Collection fetch failed")
-            await status.edit_text("⚠️ نتونستم پلی‌لیست رو بخونم. (ممکنه خصوصی باشه)")
+            await status.edit_text(
+                "⚠️ نتونستم این پلی‌لیست/آلبوم رو بخونم.\n"
+                "(پلی‌لیست‌های خصوصی یا پلی‌لیست‌های رسمی خود اسپاتیفای توسط API محدود شدن)"
+            )
             return
         if not coll or not coll.tracks:
             await status.edit_text("❌ آهنگی توی این لیست پیدا نشد.")
@@ -353,25 +372,38 @@ class SpotifyBot:
                                reply_markup=collection_keyboard())
 
     async def _download_many(self, message, tracks, user_id, status):
-        """Download each track; returns list of (Track, Path, lyrics)."""
+        """Download each track; skips per-track failures, cleans up on cancel."""
         quality = self.history.get_quality(
             user_id, self.settings.default_quality)
         cancel_ev = self._cancel_event(user_id)
         done = []
+        failed = []
         try:
             for i, t in enumerate(tracks, 1):
                 if cancel_ev.is_set():
                     raise Cancelled("cancelled by user")
-                await status.edit_text(
-                    f"⏳ {i}/{len(tracks)}: {html.escape(t.title)}...",
-                    reply_markup=cancel_keyboard())
-                async with self.global_semaphore:
-                    path, lyrics = await self.downloader.download(
-                        t, quality, cancel_ev)
-                done.append((t, path, lyrics))
+                try:
+                    await status.edit_text(
+                        f"⏳ {i}/{len(tracks)}: {html.escape(t.title)}...",
+                        reply_markup=cancel_keyboard())
+                except Exception:
+                    pass
+                try:
+                    async with self.global_semaphore:
+                        path, lyrics = await self.downloader.download(
+                            t, quality, cancel_ev, with_lyrics=False)
+                    done.append((t, path, lyrics))
+                except Cancelled:
+                    raise
+                except Exception as e:
+                    log.warning("Skipping failed track %s: %s", t.title, e)
+                    failed.append(t.title)
+        except BaseException:
+            self._cleanup([p for _, p, _ in done])
+            raise
         finally:
             self._clear_cancel(user_id)
-        return done
+        return done, failed
 
     @staticmethod
     def _cleanup(paths):
@@ -394,34 +426,39 @@ class SpotifyBot:
             status = await message.answer(
                 f"🎵 شروع دانلود تکی {len(coll.tracks)} آهنگ...",
                 reply_markup=cancel_keyboard())
+            done = []
             try:
-                done = await self._download_many(
+                done, failed = await self._download_many(
                     message, list(coll.tracks), user_id, status)
+                if not done:
+                    await status.edit_text("❌ هیچ‌کدوم از آهنگ‌ها دانلود نشد.")
+                    return
+                await status.edit_text(f"📤 {len(done)} آهنگ آماده‌ست؛ می‌فرستم...")
+                quality = self.history.get_quality(
+                    user_id, self.settings.default_quality)
+                for t, path, _lyrics in done:
+                    try:
+                        sent = await message.answer_audio(
+                            FSInputFile(path),
+                            title=t.title, performer=t.artist_text,
+                            caption=track_caption(t),
+                        )
+                        if sent.audio:
+                            self.history.save(
+                                user_id, t.id, t.title, t.artist_text,
+                                sent.audio.file_id, quality,
+                                path.stat().st_size)
+                    except Exception:
+                        log.exception("Failed sending track %s", t.id)
+                if failed:
+                    await status.edit_text(
+                        f"⚠️ {len(failed)} آهنگ پیدا نشد و رد شد.")
+                else:
+                    await status.delete()
             except Cancelled:
                 await status.edit_text("❌ لغو شد.")
-                return
-            except DownloadError as e:
-                await status.edit_text(f"❌ خطا در دانلود: {e}")
-                return
-            await status.edit_text(f"📤 {len(done)} آهنگ آماده‌ست؛ می‌فرستم...")
-            for t, path, _lyrics in done:
-                try:
-                    sent = await message.answer_audio(
-                        FSInputFile(path),
-                        title=t.title, performer=t.artist_text,
-                        caption=f"🎵 {t.title}\n👤 {t.artist_text}"[:MAX_CAPTION],
-                    )
-                    if sent.audio:
-                        self.history.save(
-                            user_id, t.id, t.title, t.artist_text,
-                            sent.audio.file_id,
-                            self.history.get_quality(
-                                user_id, self.settings.default_quality),
-                            path.stat().st_size)
-                except Exception:
-                    log.exception("Failed sending track %s", t.id)
-            await status.delete()
-            self._cleanup([p for _, p, _ in done])
+            finally:
+                self._cleanup([p for _, p, _ in done])
 
     async def _send_collection_zip(self, message, coll, user_id):
         lock = self._lock(user_id)
@@ -432,62 +469,65 @@ class SpotifyBot:
             status = await message.answer(
                 f"📦 شروع دانلود {len(coll.tracks)} آهنگ برای ZIP...",
                 reply_markup=cancel_keyboard())
+            done = []
+            tmpdir = None
             try:
-                done = await self._download_many(
+                done, failed = await self._download_many(
                     message, list(coll.tracks), user_id, status)
-            except Cancelled:
-                await status.edit_text("❌ لغو شد.")
-                return
-            except DownloadError as e:
-                await status.edit_text(f"❌ خطا در دانلود: {e}")
-                return
-            if not done:
-                await status.edit_text("❌ هیچ فایلی دانلود نشد.")
-                return
-            await status.edit_text("📦 دارم زیپ می‌کنم...")
-            max_bytes = self.settings.max_file_size_mb * 1024 * 1024
-            tmpdir = Path(tempfile.mkdtemp(prefix="spzip-"))
-            parts = []
-            idx = 1
-            current = None
-            current_size = 0
+                if not done:
+                    await status.edit_text("❌ هیچ فایلی دانلود نشد.")
+                    return
+                await status.edit_text("📦 دارم زیپ می‌کنم...")
+                max_bytes = self.settings.max_file_size_mb * 1024 * 1024
+                tmpdir = Path(tempfile.mkdtemp(prefix="spzip-"))
+                parts = []
+                idx = 1
+                current = None
+                current_size = 0
 
-            def new_part():
-                nonlocal idx, current, current_size
+                def new_part():
+                    nonlocal idx, current, current_size
+                    if current:
+                        current.close()
+                    name = f"{coll.name}-part{idx}.zip" if len(done) > 1 else f"{coll.name}.zip"
+                    safe = "".join(
+                        c for c in name if c not in '<>:"/\\|?*')[:120] or "playlist.zip"
+                    zp = tmpdir / safe
+                    current = zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED)
+                    parts.append(zp)
+                    current_size = 0
+                    idx += 1
+
+                new_part()
+                for t, path, _lyrics in done:
+                    size = path.stat().st_size
+                    if current_size + size > max_bytes and current_size > 0:
+                        new_part()
+                    arcname = f"{safe_name(f'{t.artist_text} - {t.title}')}.mp3"
+                    current.write(path, arcname)
+                    current_size += size
                 if current:
                     current.close()
-                name = f"{coll.name}-part{idx}.zip" if len(done) > 1 else f"{coll.name}.zip"
-                safe = "".join(
-                    c for c in name if c not in '<>:"/\\|?*')[:120] or "playlist.zip"
-                zp = tmpdir / safe
-                current = zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED)
-                parts.append(zp)
-                current_size = 0
-                idx += 1
-
-            new_part()
-            from .downloader import safe_name as _safe
-            for t, path, _lyrics in done:
-                size = path.stat().st_size
-                if current_size + size > max_bytes and current_size > 0:
-                    new_part()
-                arcname = f"{_safe(f'{t.artist_text} - {t.title}')}.mp3"
-                current.write(path, arcname)
-                current_size += size
-            if current:
-                current.close()
-            await status.edit_text(f"📤 {len(parts)} فایل ZIP آماده‌ست؛ می‌فرستم...")
-            for zp in parts:
-                try:
-                    await message.answer_document(
-                        FSInputFile(zp),
-                        caption=f"📦 {coll.name} ({len(done)} آهنگ)"[:MAX_CAPTION],
-                    )
-                except Exception:
-                    log.exception("Failed sending zip %s", zp)
-            await status.delete()
-            self._cleanup([p for _, p, _ in done])
-            shutil.rmtree(tmpdir, ignore_errors=True)
+                await status.edit_text(f"📤 {len(parts)} فایل ZIP آماده‌ست؛ می‌فرستم...")
+                for zp in parts:
+                    try:
+                        await message.answer_document(
+                            FSInputFile(zp),
+                            caption=f"📦 {html.escape(coll.name)} ({len(done)} آهنگ)"[:MAX_CAPTION],
+                        )
+                    except Exception:
+                        log.exception("Failed sending zip %s", zp)
+                if failed:
+                    await status.edit_text(
+                        f"⚠️ {len(failed)} آهنگ پیدا نشد و توی ZIP نیومد.")
+                else:
+                    await status.delete()
+            except Cancelled:
+                await status.edit_text("❌ لغو شد.")
+            finally:
+                self._cleanup([p for _, p, _ in done])
+                if tmpdir:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def run(self):
         await self.dp.start_polling(self.bot)

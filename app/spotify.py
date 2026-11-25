@@ -1,4 +1,5 @@
 import re
+import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlparse
 import spotipy
@@ -7,8 +8,10 @@ from spotipy.oauth2 import SpotifyClientCredentials
 # Accepts optional locale prefix: /intl-<lang>/track/<id>
 TRACK_RE = re.compile(r"^(?:/intl-[a-zA-Z-]+)?/track/([A-Za-z0-9]+)$")
 COLLECTION_RE = re.compile(r"^(?:/intl-[a-zA-Z-]+)?/(playlist|album)/([A-Za-z0-9]+)$")
+URL_RE = re.compile(r"https?://\S+")
 
 SPOTIFY_HOSTS = {"open.spotify.com", "spotify.com"}
+SHORT_HOSTS = {"spotify.link", "spoti.fi"}
 
 
 @dataclass(frozen=True)
@@ -38,9 +41,33 @@ class Collection:
     tracks: tuple
 
 
-def _path(url):
+def extract_first_url(text):
+    """Extract the first http(s) URL from a message, or return text stripped."""
+    if not text:
+        return ""
+    m = URL_RE.search(text)
+    return m.group(0).rstrip(").,]}>\"'") if m else text.strip()
+
+
+def resolve_short_url(url, timeout=10):
+    """Follow redirects for spotify.link / spoti.fi short links."""
     try:
         parsed = urlparse(url.strip())
+    except ValueError:
+        return url
+    if parsed.netloc.lower() not in SHORT_HOSTS:
+        return url
+    try:
+        req = urllib.request.Request(url.strip(), headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
+
+def _path(url):
+    try:
+        parsed = urlparse(extract_first_url(url))
     except ValueError:
         return None
     if parsed.netloc.lower() not in SPOTIFY_HOSTS:
@@ -56,6 +83,13 @@ class SpotifyService:
                 client_secret=client_secret,
             )
         )
+
+    @staticmethod
+    def is_short_url(url):
+        try:
+            return urlparse(extract_first_url(url)).netloc.lower() in SHORT_HOSTS
+        except ValueError:
+            return False
 
     @staticmethod
     def extract_track_id(url):

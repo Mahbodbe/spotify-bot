@@ -1,50 +1,39 @@
-# Spotify Telegram Bot 🎵
+# Spotify Telegram Bot
 
-A focused Telegram bot: send a Spotify track URL and receive an MP3.
+Telegram bot for downloading Spotify tracks, playlists, and albums as tagged MP3s (with cover art and optional lyrics).
 
-## Architecture
+## How it works
 
-Spotify's Web API provides track metadata, not the track's raw audio stream. This bot uses Spotify to identify the exact track, then searches a public audio source with yt-dlp, validates the result duration, converts it to MP3 with FFmpeg, sends it to Telegram, and removes the temporary file.
+Spotify's Web API provides track metadata (title, artist, album, cover, duration), not the raw audio stream. The bot resolves the track on Spotify, searches public audio sources via `yt-dlp` (YouTube first with flat multi-candidate duration matching, SoundCloud fallback), converts to MP3 with `FFmpeg`, embeds ID3 tags + cover art with `mutagen`, sends the audio to Telegram, and cleans up temporary files.
 
-Use the bot only for audio you are authorized to download and redistribute.
+## Features
+
+- **Single tracks**: Send any `open.spotify.com/track/...` or `spotify.link/...` URL.
+- **Playlists & albums**: Download sequentially or packed into size-limited ZIP parts.
+- **Inline search**: Send a song name directly and pick from top 5 Spotify results.
+- **Quality & cache**: `/quality` (128 / 192 / 320 kbps), SQLite `file_id` cache, `/stats`, and `/cancel`.
 
 ## Requirements
 
 - Python 3.12+
-- FFmpeg
-- Telegram bot token
-- Spotify Client ID and Client Secret
+- `ffmpeg` and `nodejs` (required by `yt-dlp` for YouTube signature challenges)
+- Telegram Bot Token (`BOT_TOKEN`)
+- Spotify App credentials (`SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`)
 
 ## Setup
 
-Create `.env` from `.env.example` and fill in:
-
-```
-BOT_TOKEN=...
-SPOTIFY_CLIENT_ID=...
-SPOTIFY_CLIENT_SECRET=...
-```
-
-Then:
-
 ```bash
+cp .env.example .env
+# Fill in BOT_TOKEN, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
 pip install -r requirements.txt
 python -m app
 ```
 
-## Docker
+### Docker
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-## Current feature
-
-Input:
-
-`https://open.spotify.com/track/<id>`
-
-Output: an MP3 Telegram audio message with title and artist metadata.
-
-Albums, playlists, Spotify search, queues, history, and user accounts are intentionally out of scope for this first version.
+If running on a VPS/datacenter IP where YouTube blocks anonymous requests, place a Netscape-format `cookies.txt` at `downloads/.cookies-yt` (matches `YT_COOKIEFILE` in `.env.example`).

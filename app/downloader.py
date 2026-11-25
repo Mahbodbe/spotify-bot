@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import re
 import urllib.request
 import uuid
 from pathlib import Path
 import yt_dlp
 import yt_dlp.utils
+
+log = logging.getLogger(__name__)
 
 LYRICS_API = "https://lrclib.net/api/get"
 
@@ -90,12 +93,22 @@ def _pick_by_duration(entries, target_sec, tolerance=90):
             best, best_diff = e, diff
     if best is not None:
         return best
-    # no duration info at all — fall back to first entry
     if entries and all(
             not (isinstance(e, dict) and e.get("duration"))
             for e in entries):
         return entries[0]
     return None
+
+
+def _entry_url(entry, source):
+    """Extract a downloadable URL from either a full or flat yt-dlp entry."""
+    url = entry.get("webpage_url") or entry.get("url") or ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    vid = entry.get("id")
+    if vid and source == "youtube":
+        return f"https://www.youtube.com/watch?v={vid}"
+    return ""
 
 
 class AudioDownloader:
@@ -161,36 +174,64 @@ class AudioDownloader:
                 raise DownloadError("File is too large")
             return output
 
-    def _search_candidates(self, options, query, target_sec):
-        """Search (no download); return up to 3 candidate webpage URLs
+    def _search_candidates(self, query, target_sec, source, cookiefile=None):
+        """Flat search (fast, avoids per-video fetches); return up to 3 URLs
         ordered by duration closeness."""
-        options = dict(options)
-        options["quiet"] = True
-        with yt_dlp.YoutubeDL(options) as ydl:
+        search_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "socket_timeout": 20,
+        }
+        if cookiefile:
+            search_opts["cookiefile"] = cookiefile
+        with yt_dlp.YoutubeDL(search_opts) as ydl:
             info = ydl.extract_info(query, download=False)
         raw = info.get("entries") if isinstance(info, dict) else None
         entries = []
         if raw:
-            count = 0
-            it = iter(raw)  # type: ignore[arg-type]
-            while count < 5:
-                try:
-                    entries.append(next(it))
-                except StopIteration:
+            for e in raw:
+                if isinstance(e, dict):
+                    entries.append(e)
+                if len(entries) >= 5:
                     break
-                count += 1
-        cands = []
-        for e in entries[:5]:
-            if not isinstance(e, dict):
-                continue
-            d = e.get("duration")
-            page = e.get("webpage_url")
+        within = []
+        unknown = []
+        for e in entries:
+            page = _entry_url(e, source)
             if not page:
                 continue
-            diff = abs(d - target_sec) if d else 10 ** 9
-            cands.append((diff, page))
-        cands.sort(key=lambda x: x[0])
-        return [p for diff, p in cands if diff <= 90]
+            d = e.get("duration")
+            if d:
+                diff = abs(d - target_sec)
+                if diff <= 90:
+                    within.append((diff, page))
+            else:
+                unknown.append(page)
+        within.sort(key=lambda x: x[0])
+        ordered = [p for _, p in within] + unknown
+        return ordered[:3]
+
+    def _try_source(self, source, query, target_sec, opts, progress_hook,
+                    cancel_event):
+        pages = self._search_candidates(
+            query, target_sec, source, opts.get("cookiefile"))
+        if not pages:
+            raise DownloadError(f"no {source} match within duration")
+        last_err = None
+        for page in pages:
+            self._check_cancel(cancel_event)
+            try:
+                output = self._download_url(opts, page, progress_hook)
+                log.info("source=%s page=%s", source, page)
+                return output
+            except Cancelled:
+                raise
+            except Exception as e:
+                last_err = e
+                log.warning("%s candidate failed (%s): %s", source, page, e)
+        raise DownloadError(f"{source}: {last_err}")
 
     def _download(self, track, quality, cancel_event, with_cover, with_lyrics):
         self._check_cancel(cancel_event)
@@ -206,53 +247,36 @@ class AudioDownloader:
 
         base = self._base_options(outtmpl, quality, progress_hook)
         errors = []
+        output = None
 
-        # 1) YouTube search (with cookies when available)
+        # 1) YouTube search (top 5 flat search, tries up to 3 best matches)
         yt_opts = dict(base)
-        yt_opts["default_search"] = "ytsearch1"
         if self.cookiefile:
             yt_opts["cookiefile"] = self.cookiefile
         try:
-            pages = self._search_candidates(
-                yt_opts, f"ytsearch1:{track.search_query}", target_sec)
-            if not pages:
-                raise DownloadError("No YouTube match within duration")
-            output = self._download_url(yt_opts, pages[0], progress_hook)
-            import logging as _lg
-            _lg.getLogger(__name__).info("source=youtube page=%s", pages[0])
-        except (Cancelled, DownloadError) as e:
-            if isinstance(e, Cancelled):
-                raise
-            errors.append(f"youtube: {e}")
-            output = None
+            output = self._try_source(
+                "youtube", f"ytsearch5:{track.search_query}",
+                target_sec, yt_opts, progress_hook, cancel_event,
+            )
+        except Cancelled:
+            raise
         except Exception as e:
-            errors.append(f"youtube: {e}")
-            output = None
+            errors.append(str(e))
 
         # 2) SoundCloud fallback (no login needed, datacenter-friendly)
         if output is None:
             sc_opts = dict(base)
-            sc_opts["default_search"] = "scsearch1"
             try:
-                pages = self._search_candidates(
-                    sc_opts,
-                    f"scsearch1:{track.artist_text} {track.title}",
-                    target_sec)
-                if not pages:
-                    raise DownloadError("No SoundCloud match within duration")
-                output = self._download_url(sc_opts, pages[0], progress_hook)
-                import logging as _lg2
-                _lg2.getLogger(__name__).info(
-                    "source=soundcloud page=%s", pages[0])
+                output = self._try_source(
+                    "soundcloud",
+                    f"scsearch5:{track.artist_text} {track.title}",
+                    target_sec, sc_opts, progress_hook, cancel_event,
+                )
             except Cancelled:
                 raise
-            except DownloadError as e:
-                raise DownloadError(
-                    "نتونستم نسخه صوتی پیدا کنم (" +
-                    "; ".join(errors + [f"soundcloud: {e}"]) + ")")
             except Exception as e:
-                raise DownloadError(
-                    f"نتونستم نسخه صوتی پیدا کنم ({errors}; sc: {e})")
+                errors.append(str(e))
+                raise DownloadError("; ".join(errors))
 
         cover = fetch_bytes(track.cover_url) if with_cover else b""
         lyrics = fetch_lyrics(track.artists[0] if track.artists else "",

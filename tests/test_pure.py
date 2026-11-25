@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.downloader import safe_name  # noqa: E402
+from app.downloader import _entry_url, _pick_by_duration, safe_name  # noqa: E402
 from app.history import History  # noqa: E402
 
 TRACK_RE = re.compile(r"^(?:/intl-[a-zA-Z-]+)?/track/([A-Za-z0-9]+)$")
@@ -114,3 +114,11 @@ def test_history_prefs_and_stats():
         assert h.get_cached(1, "t1")["file_id"] == "fileid2"
         assert h.stats(1) == {"count": 1, "bytes": 2000}
         assert h.stats(999) == {"count": 0, "bytes": 0}
+
+
+def test_entry_url_and_duration_picker():
+    assert _entry_url({"id": "dQw4w9WgXcQ"}, "youtube") == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert _entry_url({"url": "https://soundcloud.com/a/b"}, "soundcloud") == "https://soundcloud.com/a/b"
+    picked = _pick_by_duration([{"duration": 600, "id": "bad"}, {"duration": 212, "id": "ok"}], 210)
+    assert picked["id"] == "ok"
+
