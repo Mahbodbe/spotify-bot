@@ -238,13 +238,12 @@ class AudioDownloader:
             opts = self._base_options(outtmpl, quality, progress_hook)
             is_audio = True
         else:
-            mb = self.max_mb
             opts = {
                 "format": (
-                    f"bestvideo[height<=720][ext=mp4][filesize?<{mb}M]"
-                    f"+bestaudio[ext=m4a]/best[height<=720][ext=mp4][filesize?<{mb}M]"
-                    f"/best[ext=mp4][filesize?<{mb}M]/best[filesize?<{mb}M]/best"
+                    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+                    "/best[height<=720][ext=mp4]/best[ext=mp4]/best"
                 ),
+                "max_filesize": self.max_bytes,
                 "outtmpl": outtmpl,
                 "merge_output_format": "mp4",
                 "noplaylist": True,
