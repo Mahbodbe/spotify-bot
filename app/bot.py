@@ -20,7 +20,13 @@ from aiogram.types import (
 )
 
 from .config import Settings
-from .downloader import AudioDownloader, Cancelled, DownloadError, safe_name
+from .downloader import (
+    AudioDownloader,
+    Cancelled,
+    DownloadError,
+    detect_media_platform,
+    safe_name,
+)
 from .history import History
 from .spotify import SpotifyService, extract_first_url, resolve_short_url
 
@@ -50,6 +56,16 @@ def collection_keyboard():
         [InlineKeyboardButton(text="🎵 دونه‌دونه بفرست",
                               callback_data="pl:seq")],
         [InlineKeyboardButton(text="❌ بیخیال", callback_data="pl:no")],
+    ])
+
+
+def media_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎬 ویدیو (MP4)", callback_data="m:video"),
+            InlineKeyboardButton(text="🎵 فقط صدا (MP3)", callback_data="m:audio"),
+        ],
+        [InlineKeyboardButton(text="❌ لغو", callback_data="m:no")],
     ])
 
 
@@ -88,6 +104,7 @@ class SpotifyBot:
             settings.download_dir,
             settings.max_file_size_mb,
             settings.cookiefile,
+            settings.ig_cookiefile,
         )
         self.history = History(
             str(Path(settings.download_dir) / "history.db"))
@@ -95,6 +112,7 @@ class SpotifyBot:
         self.cancel_events = {}
         self.pending_search = {}   # user_id -> {track_id: Track}
         self.pending_coll = {}     # user_id -> Collection
+        self.pending_media = {}    # user_id -> url
         self.global_semaphore = asyncio.Semaphore(2)
         self._bg_tasks = set()
 
@@ -110,6 +128,8 @@ class SpotifyBot:
             self.on_search_pick, F.data.startswith("s:"))
         self.dp.callback_query.register(
             self.on_collection, F.data.startswith("pl:"))
+        self.dp.callback_query.register(
+            self.on_media_pick, F.data.startswith("m:"))
         self.dp.callback_query.register(self.on_cancel, F.data == "cancel")
 
     # -- helpers --
@@ -131,10 +151,10 @@ class SpotifyBot:
     # -- commands --
     async def start(self, message: Message):
         await message.answer(
-            "🎵 سلام! لینک آهنگ Spotify رو بفرست تا نسخه صوتی‌ش رو برات ارسال کنم.\n\n"
-            "• تک‌آهنگ (Track) → مستقیم MP3\n"
-            "• پلی‌لیست / آلبوم → انتخاب ZIP یا دونه‌دونه\n"
-            "• یا اسم آهنگ رو بنویس تا سرچ کنم 🔎\n\n"
+            "🎵 سلام! لینک بفرست تا برات دانلود کنم:\n\n"
+            "• <b>Spotify</b> — تک‌آهنگ (MP3)، پلی‌لیست / آلبوم (ZIP یا تکی)، یا اسم آهنگ برای سرچ 🔎\n"
+            "• <b>YouTube / Shorts</b> — انتخاب ویدیو (MP4) یا فقط صدا (MP3)\n"
+            "• <b>Instagram / X (Twitter)</b> — دانلود مستقیم ویدیو و ریلز\n\n"
             "دستورات:\n"
             "/quality — انتخاب کیفیت صدا\n"
             "/stats — آمار دانلودهای خودت\n"
@@ -225,6 +245,22 @@ class SpotifyBot:
             await self._send_collection_seq(query.message, coll,
                                             query.from_user.id)
 
+    async def on_media_pick(self, query: CallbackQuery):
+        await query.answer()
+        mode = (query.data or "").split(":")[1] if ":" in (query.data or "") else ""
+        url = self.pending_media.pop(query.from_user.id, None)
+        if mode == "no" or not url:
+            try:
+                await query.message.edit_text("لغو شد. 👍")
+            except Exception:
+                pass
+            return
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await self._send_media(query.message, url, mode, query.from_user.id)
+
     # -- main text handler --
     async def handle_text(self, message: Message):
         raw = (message.text or "").strip()
@@ -249,6 +285,18 @@ class SpotifyBot:
 
         if self.spotify.extract_collection(url):
             await self._handle_collection(message, url, user_id)
+            return
+
+        platform = detect_media_platform(url)
+        if platform == "youtube":
+            self.pending_media[user_id] = url
+            await message.answer(
+                "🎬 لینک یوتیوب تشخیص داده شد؛ چطور دانلود کنم؟",
+                reply_markup=media_keyboard(),
+            )
+            return
+        if platform in ("instagram", "twitter"):
+            await self._send_media(message, url, "video", user_id)
             return
 
         # Plain text → Spotify search
@@ -337,6 +385,54 @@ class SpotifyBot:
                         shutil.rmtree(path.parent, ignore_errors=True)
                     except Exception:
                         pass
+
+    # -- direct media (YouTube / Instagram / Twitter) --
+    async def _send_media(self, message: Message, url: str, mode: str, user_id: int):
+        lock = self._lock(user_id)
+        if lock.locked():
+            await message.answer("⏳ درخواست قبلیت هنوز در حال پردازشه.")
+            return
+        quality = self.history.get_quality(
+            user_id, self.settings.default_quality)
+        async with lock:
+            cancel_ev = self._cancel_event(user_id)
+            label = "🎵 صدا (MP3)" if mode == "audio" else "🎬 ویدیو (MP4)"
+            status = await message.answer(
+                f"⏳ دارم {label} رو دانلود می‌کنم...",
+                reply_markup=cancel_keyboard(),
+            )
+            path = None
+            try:
+                async with self.global_semaphore:
+                    action = (ChatAction.UPLOAD_VOICE if mode == "audio"
+                              else ChatAction.UPLOAD_VIDEO)
+                    await self.bot.send_chat_action(message.chat.id, action)
+                    path, title, is_audio = await self.downloader.download_media(
+                        url, mode=mode, quality=quality, cancel_event=cancel_ev)
+                await status.edit_text("📤 فایل آماده‌ست؛ دارم می‌فرستم...")
+                cap = html.escape(title)[:MAX_CAPTION]
+                if is_audio:
+                    await message.answer_audio(
+                        FSInputFile(path), title=title, caption=f"🎵 {cap}")
+                else:
+                    await message.answer_video(
+                        FSInputFile(path), caption=f"🎬 {cap}")
+                await status.delete()
+            except Cancelled:
+                await status.edit_text("❌ لغو شد.")
+            except DownloadError as e:
+                log.warning("Media download failed (%s): %s", url, e)
+                await status.edit_text(
+                    "❌ دانلود انجام نشد.\n"
+                    "ممکنه پست خصوصی باشه، حجمش بالای ۴۵ مگابایت باشه یا محدودیت پلتفرم داشته باشه."
+                )
+            except Exception:
+                log.exception("Unhandled error downloading media %s", url)
+                await status.edit_text("⚠️ یک خطای غیرمنتظره رخ داد؛ دوباره امتحان کن.")
+            finally:
+                self._clear_cancel(user_id)
+                if isinstance(path, Path):
+                    shutil.rmtree(path.parent, ignore_errors=True)
 
     # -- collection (playlist/album) --
     async def _handle_collection(self, message: Message, url, user_id):

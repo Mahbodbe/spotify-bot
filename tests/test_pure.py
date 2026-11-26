@@ -8,7 +8,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.downloader import _entry_url, _pick_by_duration, safe_name  # noqa: E402
+from app.downloader import (  # noqa: E402
+    _entry_url,
+    _pick_by_duration,
+    detect_media_platform,
+    safe_name,
+)
 from app.history import History  # noqa: E402
 
 TRACK_RE = re.compile(r"^(?:/intl-[a-zA-Z-]+)?/track/([A-Za-z0-9]+)$")
@@ -121,4 +126,19 @@ def test_entry_url_and_duration_picker():
     assert _entry_url({"url": "https://soundcloud.com/a/b"}, "soundcloud") == "https://soundcloud.com/a/b"
     picked = _pick_by_duration([{"duration": 600, "id": "bad"}, {"duration": 212, "id": "ok"}], 210)
     assert picked["id"] == "ok"
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube"),
+    ("https://youtu.be/dQw4w9WgXcQ", "youtube"),
+    ("https://youtube.com/shorts/abc123", "youtube"),
+    ("https://www.instagram.com/reel/Cxyz123/", "instagram"),
+    ("https://x.com/user/status/123456789", "twitter"),
+    ("https://twitter.com/user/status/123456789", "twitter"),
+    ("https://open.spotify.com/track/abc123", None),
+    ("just a song name", None),
+])
+def test_detect_media_platform(url, expected):
+    assert detect_media_platform(url) == expected
+
 

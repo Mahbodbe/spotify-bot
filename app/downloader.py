@@ -4,12 +4,35 @@ import re
 import urllib.request
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 import yt_dlp
 import yt_dlp.utils
 
 log = logging.getLogger(__name__)
 
 LYRICS_API = "https://lrclib.net/api/get"
+
+YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
+IG_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
+X_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com", "mobile.x.com"}
+
+
+def detect_media_platform(url):
+    """Return 'youtube', 'instagram', 'twitter', or None for supported direct media URLs."""
+    try:
+        parsed = urlparse((url or "").strip())
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = parsed.netloc.lower()
+    if host in YT_HOSTS:
+        return "youtube"
+    if host in IG_HOSTS:
+        return "instagram"
+    if host in X_HOSTS:
+        return "twitter"
+    return None
 
 
 class DownloadError(RuntimeError):
@@ -112,20 +135,30 @@ def _entry_url(entry, source):
 
 
 class AudioDownloader:
-    def __init__(self, download_dir, max_file_size_mb, cookiefile=None):
+    def __init__(self, download_dir, max_file_size_mb, cookiefile=None,
+                 ig_cookiefile=None):
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_file_size_mb * 1024 * 1024
-        self.cookiefile = None
-        if cookiefile:
-            cand = Path(cookiefile)
-            if not cand.is_absolute():
-                if (Path.cwd() / cand).is_file():
-                    cand = Path.cwd() / cand
-                else:
-                    cand = self.download_dir / cand
-            if cand.is_file():
-                self.cookiefile = str(cand)
+        self.max_mb = max_file_size_mb
+        self.cookiefile = self._resolve_cookie(cookiefile)
+        self.ig_cookiefile = self._resolve_cookie(ig_cookiefile)
+        if self.cookiefile:
+            log.info("YouTube cookies active: %s (%d bytes)",
+                     self.cookiefile, Path(self.cookiefile).stat().st_size)
+        if self.ig_cookiefile:
+            log.info("Instagram cookies active: %s", self.ig_cookiefile)
+
+    def _resolve_cookie(self, cookiefile):
+        if not cookiefile:
+            return None
+        cand = Path(cookiefile)
+        if not cand.is_absolute():
+            if (Path.cwd() / cand).is_file():
+                cand = Path.cwd() / cand
+            else:
+                cand = self.download_dir / cand
+        return str(cand) if cand.is_file() else None
 
     async def download(self, track, quality=192, cancel_event=None,
                        with_cover=True, with_lyrics=True):
@@ -134,9 +167,23 @@ class AudioDownloader:
             with_cover, with_lyrics,
         )
 
+    async def download_media(self, url, mode="video", quality=192,
+                             cancel_event=None):
+        """Download direct YouTube / Instagram / Twitter URL.
+        Returns (Path, title, is_audio)."""
+        return await asyncio.to_thread(
+            self._download_media, url, mode, quality, cancel_event,
+        )
+
     def _check_cancel(self, cancel_event):
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled("cancelled by user")
+
+    def _yt_extractor_args(self):
+        # tv / android_vr clients are far less likely to trigger datacenter bot checks
+        if self.cookiefile:
+            return {"youtube": {"player_client": ["tv", "web"]}}
+        return {"youtube": {"player_client": ["android_vr", "tv", "web"]}}
 
     def _base_options(self, outtmpl, quality, progress_hook):
         return {
@@ -173,6 +220,70 @@ class AudioDownloader:
                 output.unlink(missing_ok=True)
                 raise DownloadError("File is too large")
             return output
+
+    def _download_media(self, url, mode, quality, cancel_event):
+        self._check_cancel(cancel_event)
+        platform = detect_media_platform(url)
+        job_dir = self.download_dir / f"media-{uuid.uuid4().hex[:12]}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        outtmpl = str(job_dir / "%(title).120B.%(ext)s")
+
+        def progress_hook(d):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled("cancelled by user")
+
+        if mode == "audio":
+            opts = self._base_options(outtmpl, quality, progress_hook)
+            is_audio = True
+        else:
+            mb = self.max_mb
+            opts = {
+                "format": (
+                    f"bestvideo[height<=720][ext=mp4][filesize<{mb}M]"
+                    f"+bestaudio[ext=m4a]/best[height<=720][ext=mp4][filesize<{mb}M]"
+                    f"/best[ext=mp4][filesize<{mb}M]/best[filesize<{mb}M]/best"
+                ),
+                "outtmpl": outtmpl,
+                "merge_output_format": "mp4",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 30,
+                "retries": 3,
+                "fragment_retries": 3,
+                "progress_hooks": [progress_hook],
+            }
+            is_audio = False
+
+        if platform == "youtube":
+            opts["extractor_args"] = self._yt_extractor_args()
+            if self.cookiefile:
+                opts["cookiefile"] = self.cookiefile
+        elif platform == "instagram" and self.ig_cookiefile:
+            opts["cookiefile"] = self.ig_cookiefile
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = (info.get("title") or platform or "media")[:120]
+                ext = ".mp3" if is_audio else ".mp4"
+                expected = Path(ydl.prepare_filename(info)).with_suffix(ext)
+                if expected.exists():
+                    output = expected
+                else:
+                    files = [p for p in job_dir.iterdir() if p.is_file()]
+                    if not files:
+                        raise DownloadError("Media file was not produced")
+                    output = max(files, key=lambda p: p.stat().st_mtime)
+        except Cancelled:
+            raise
+        except Exception as e:
+            raise DownloadError(str(e))
+
+        if output.stat().st_size > self.max_bytes:
+            output.unlink(missing_ok=True)
+            raise DownloadError(f"File exceeds {self.max_mb} MB Telegram limit")
+        return output, title, is_audio
 
     def _search_candidates(self, query, target_sec, source, cookiefile=None):
         """Flat search (fast, avoids per-video fetches); return up to 3 URLs
@@ -251,6 +362,7 @@ class AudioDownloader:
 
         # 1) YouTube search (top 5 flat search, tries up to 3 best matches)
         yt_opts = dict(base)
+        yt_opts["extractor_args"] = self._yt_extractor_args()
         if self.cookiefile:
             yt_opts["cookiefile"] = self.cookiefile
         try:

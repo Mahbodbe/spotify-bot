@@ -8,13 +8,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _materialize_cookiefile():
-    """Support either a file path (YT_COOKIEFILE) or base64 secret (YT_COOKIES_B64)."""
-    b64 = (os.getenv("YT_COOKIES_B64") or "").strip()
+def _materialize_cookiefile(b64_env, file_env, default_name, tmp_name):
+    """Support either a file path or a base64-encoded secret env var."""
+    b64 = (os.getenv(b64_env) or "").strip()
     if b64:
         try:
             raw = base64.b64decode(b64)
-            target = Path("/tmp/.cookies-yt")
+            target = Path("/tmp") / tmp_name
             target.write_bytes(raw)
             try:
                 target.chmod(0o600)
@@ -23,7 +23,7 @@ def _materialize_cookiefile():
             return str(target)
         except Exception:
             pass
-    return os.getenv("YT_COOKIEFILE", ".cookies-yt")
+    return os.getenv(file_env, default_name)
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class Settings:
     default_quality: int
     max_playlist_tracks: int
     cookiefile: str
+    ig_cookiefile: str
     health_port: int
     webhook_url: str
     webhook_secret: str
@@ -72,7 +73,10 @@ class Settings:
             max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "45")),
             default_quality=quality,
             max_playlist_tracks=int(os.getenv("MAX_PLAYLIST_TRACKS", "30")),
-            cookiefile=_materialize_cookiefile(),
+            cookiefile=_materialize_cookiefile(
+                "YT_COOKIES_B64", "YT_COOKIEFILE", ".cookies-yt", ".cookies-yt"),
+            ig_cookiefile=_materialize_cookiefile(
+                "IG_COOKIES_B64", "IG_COOKIEFILE", ".cookies-ig", ".cookies-ig"),
             health_port=int(port_raw),
             webhook_url=webhook_url,
             webhook_secret=secret,
