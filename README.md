@@ -22,16 +22,16 @@ Spotify's Web API provides track metadata (title, artist, album, cover, duration
 - **Inline search**: Send a song name directly and pick from top 5 Spotify results.
 - **Quality & cache**: `/quality` (128 / 192 / 320 kbps), SQLite `file_id` cache, `/stats`, and `/cancel`.
 
-## Deploy on Hugging Face Spaces (Free, Docker SDK)
+## Deploy Free on Render (Docker + Auto Webhook)
 
-1. Create a new Space on [Hugging Face](https://huggingface.co/new-space) with **SDK: Docker** (Blank template) and **Private** visibility.
-2. Push this repo to the Space (`git remote add hf https://huggingface.co/spaces/<user>/<space> && git push hf main`).
-3. In **Settings → Variables and secrets**, add these **Secrets**:
+1. Go to [Render](https://dashboard.render.com) → **New → Web Service** → connect this GitHub repo.
+2. Choose **Language: Docker** and **Instance Type: Free**.
+3. Add these **Environment Variables**:
    - `BOT_TOKEN`
    - `SPOTIFY_CLIENT_ID`
    - `SPOTIFY_CLIENT_SECRET`
    - *(Optional)* `YT_COOKIES_B64` — base64-encoded YouTube `cookies.txt` if YouTube blocks datacenter IPs.
-4. The container automatically runs as UID 1000, stores temp files in `/tmp/downloads`, and serves a health check on port `7860`.
+4. Deploy. Render automatically provides `RENDER_EXTERNAL_URL` and `PORT`, so the bot auto-switches to **Webhook mode** (waking up automatically whenever a Telegram message arrives).
 
 ## Local / Docker Compose
 

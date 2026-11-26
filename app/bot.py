@@ -16,6 +16,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    Update,
 )
 
 from .config import Settings
@@ -95,6 +96,7 @@ class SpotifyBot:
         self.pending_search = {}   # user_id -> {track_id: Track}
         self.pending_coll = {}     # user_id -> Collection
         self.global_semaphore = asyncio.Semaphore(2)
+        self._bg_tasks = set()
 
         self.dp.message.register(self.start, CommandStart())
         self.dp.message.register(self.cmd_quality, Command("quality"))
@@ -529,32 +531,75 @@ class SpotifyBot:
                 if tmpdir:
                     shutil.rmtree(tmpdir, ignore_errors=True)
 
-    async def _start_health_server(self):
-        """Lightweight HTTP health endpoint for Hugging Face Spaces / PaaS."""
+    async def _start_web_server(self, webhook_mode=False):
+        """HTTP server for health checks and (in serverless/Render) Telegram webhooks."""
         from aiohttp import web
 
         async def ok(_request):
-            return web.json_response({"status": "ok", "bot": "spotify-bot"})
+            return web.json_response({
+                "status": "ok",
+                "bot": "spotify-bot",
+                "mode": "webhook" if webhook_mode else "polling",
+            })
+
+        async def handle_webhook(request):
+            if self.settings.webhook_secret:
+                got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+                if got != self.settings.webhook_secret:
+                    return web.Response(status=403, text="forbidden")
+            try:
+                data = await request.json()
+                update = Update.model_validate(data, context={"bot": self.bot})
+            except Exception:
+                log.exception("Invalid webhook payload")
+                return web.Response(status=400, text="bad request")
+
+            task = asyncio.create_task(self.dp.feed_update(self.bot, update))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            return web.Response(text="ok")
 
         app = web.Application()
         app.router.add_get("/", ok)
         app.router.add_get("/health", ok)
+        if webhook_mode:
+            app.router.add_post("/webhook", handle_webhook)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.settings.health_port)
+        port = self.settings.health_port or 7860
+        site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        log.info("Health server listening on 0.0.0.0:%d", self.settings.health_port)
+        log.info("HTTP server listening on 0.0.0.0:%d (mode=%s)",
+                 port, "webhook" if webhook_mode else "polling")
         return runner
 
     async def run(self):
-        runner = None
-        if self.settings.health_port > 0:
-            runner = await self._start_health_server()
-        try:
-            await self.dp.start_polling(self.bot)
-        finally:
-            if runner is not None:
+        if self.settings.webhook_url:
+            runner = await self._start_web_server(webhook_mode=True)
+            hook = f"{self.settings.webhook_url}/webhook"
+            await self.bot.set_webhook(
+                hook,
+                secret_token=self.settings.webhook_secret,
+                drop_pending_updates=False,
+            )
+            log.info("Webhook registered at %s", hook)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                if self._bg_tasks:
+                    await asyncio.gather(*self._bg_tasks, return_exceptions=True)
                 await runner.cleanup()
+                await self.bot.session.close()
+        else:
+            runner = None
+            if self.settings.health_port > 0:
+                runner = await self._start_web_server(webhook_mode=False)
+            try:
+                await self.bot.delete_webhook(drop_pending_updates=False)
+                await self.dp.start_polling(self.bot)
+            finally:
+                if runner is not None:
+                    await runner.cleanup()
 
 
 async def main():

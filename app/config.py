@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,8 @@ class Settings:
     max_playlist_tracks: int
     cookiefile: str
     health_port: int
+    webhook_url: str
+    webhook_secret: str
 
     @classmethod
     def from_env(cls):
@@ -50,8 +53,17 @@ class Settings:
         quality = int(os.getenv("DEFAULT_QUALITY", "192"))
         if quality not in (128, 192, 320):
             quality = 192
-        default_dir = "/tmp/downloads" if os.getenv("SPACE_ID") else "downloads"
-        port_raw = os.getenv("PORT") or ("7860" if os.getenv("SPACE_ID") else "0")
+        webhook_url = (
+            os.getenv("WEBHOOK_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+            or ""
+        ).strip().rstrip("/")
+        is_paas = bool(webhook_url or os.getenv("RENDER") or os.getenv("SPACE_ID"))
+        default_dir = "/tmp/downloads" if is_paas else "downloads"
+        port_raw = os.getenv("PORT") or ("7860" if is_paas else "0")
+        secret = (os.getenv("WEBHOOK_SECRET") or "").strip()
+        if not secret and webhook_url:
+            secret = hashlib.sha256(values["BOT_TOKEN"].encode()).hexdigest()[:32]
         return cls(
             bot_token=values["BOT_TOKEN"],
             spotify_client_id=values["SPOTIFY_CLIENT_ID"],
@@ -62,4 +74,6 @@ class Settings:
             max_playlist_tracks=int(os.getenv("MAX_PLAYLIST_TRACKS", "30")),
             cookiefile=_materialize_cookiefile(),
             health_port=int(port_raw),
+            webhook_url=webhook_url,
+            webhook_secret=secret,
         )
