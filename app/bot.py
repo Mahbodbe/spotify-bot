@@ -422,10 +422,14 @@ class SpotifyBot:
                 await status.edit_text("❌ لغو شد.")
             except DownloadError as e:
                 log.warning("Media download failed (%s): %s", url, e)
-                await status.edit_text(
-                    "❌ دانلود انجام نشد.\n"
-                    "ممکنه پست خصوصی باشه، حجمش بالای ۴۵ مگابایت باشه یا محدودیت پلتفرم داشته باشه."
-                )
+                msg = str(e)
+                if "confirm you" in msg.lower() or "sign in" in msg.lower():
+                    hint = "کوکی یوتیوب کامل نیست (باید شامل LOGIN_INFO و SID باشه)."
+                elif "exceeds" in msg.lower():
+                    hint = f"حجم فایل بیشتر از سقف {self.settings.max_file_size_mb} مگابایت تلگرامه."
+                else:
+                    hint = html.escape(msg[:180])
+                await status.edit_text(f"❌ دانلود انجام نشد.\n<code>{hint}</code>")
             except Exception:
                 log.exception("Unhandled error downloading media %s", url)
                 await status.edit_text("⚠️ یک خطای غیرمنتظره رخ داد؛ دوباره امتحان کن.")

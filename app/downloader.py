@@ -144,8 +144,10 @@ class AudioDownloader:
         self.cookiefile = self._resolve_cookie(cookiefile)
         self.ig_cookiefile = self._resolve_cookie(ig_cookiefile)
         if self.cookiefile:
-            log.info("YouTube cookies active: %s (%d bytes)",
-                     self.cookiefile, Path(self.cookiefile).stat().st_size)
+            raw_c = Path(self.cookiefile).read_text(encoding="utf-8", errors="ignore")
+            has_login = "LOGIN_INFO" in raw_c and "SID" in raw_c
+            log.info("YouTube cookies active: %s (%d bytes, authenticated=%s)",
+                     self.cookiefile, Path(self.cookiefile).stat().st_size, has_login)
         if self.ig_cookiefile:
             log.info("Instagram cookies active: %s", self.ig_cookiefile)
 
@@ -239,9 +241,9 @@ class AudioDownloader:
             mb = self.max_mb
             opts = {
                 "format": (
-                    f"bestvideo[height<=720][ext=mp4][filesize<{mb}M]"
-                    f"+bestaudio[ext=m4a]/best[height<=720][ext=mp4][filesize<{mb}M]"
-                    f"/best[ext=mp4][filesize<{mb}M]/best[filesize<{mb}M]/best"
+                    f"bestvideo[height<=720][ext=mp4][filesize?<{mb}M]"
+                    f"+bestaudio[ext=m4a]/best[height<=720][ext=mp4][filesize?<{mb}M]"
+                    f"/best[ext=mp4][filesize?<{mb}M]/best[filesize?<{mb}M]/best"
                 ),
                 "outtmpl": outtmpl,
                 "merge_output_format": "mp4",
