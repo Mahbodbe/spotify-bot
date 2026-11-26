@@ -1,3 +1,12 @@
+---
+title: Spotify Telegram Bot
+emoji: 🎵
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+---
+
 # Spotify Telegram Bot
 
 Telegram bot for downloading Spotify tracks, playlists, and albums as tagged MP3s (with cover art and optional lyrics).
@@ -13,27 +22,21 @@ Spotify's Web API provides track metadata (title, artist, album, cover, duration
 - **Inline search**: Send a song name directly and pick from top 5 Spotify results.
 - **Quality & cache**: `/quality` (128 / 192 / 320 kbps), SQLite `file_id` cache, `/stats`, and `/cancel`.
 
-## Requirements
+## Deploy on Hugging Face Spaces (Free, Docker SDK)
 
-- Python 3.12+
-- `ffmpeg` and `nodejs` (required by `yt-dlp` for YouTube signature challenges)
-- Telegram Bot Token (`BOT_TOKEN`)
-- Spotify App credentials (`SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`)
+1. Create a new Space on [Hugging Face](https://huggingface.co/new-space) with **SDK: Docker** (Blank template) and **Private** visibility.
+2. Push this repo to the Space (`git remote add hf https://huggingface.co/spaces/<user>/<space> && git push hf main`).
+3. In **Settings → Variables and secrets**, add these **Secrets**:
+   - `BOT_TOKEN`
+   - `SPOTIFY_CLIENT_ID`
+   - `SPOTIFY_CLIENT_SECRET`
+   - *(Optional)* `YT_COOKIES_B64` — base64-encoded YouTube `cookies.txt` if YouTube blocks datacenter IPs.
+4. The container automatically runs as UID 1000, stores temp files in `/tmp/downloads`, and serves a health check on port `7860`.
 
-## Setup
+## Local / Docker Compose
 
 ```bash
 cp .env.example .env
 # Fill in BOT_TOKEN, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
-pip install -r requirements.txt
-python -m app
-```
-
-### Docker
-
-```bash
-cp .env.example .env
 docker compose up -d --build
 ```
-
-If running on a VPS/datacenter IP where YouTube blocks anonymous requests, place a Netscape-format `cookies.txt` at `downloads/.cookies-yt` (matches `YT_COOKIEFILE` in `.env.example`).

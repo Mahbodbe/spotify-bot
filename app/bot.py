@@ -529,8 +529,32 @@ class SpotifyBot:
                 if tmpdir:
                     shutil.rmtree(tmpdir, ignore_errors=True)
 
+    async def _start_health_server(self):
+        """Lightweight HTTP health endpoint for Hugging Face Spaces / PaaS."""
+        from aiohttp import web
+
+        async def ok(_request):
+            return web.json_response({"status": "ok", "bot": "spotify-bot"})
+
+        app = web.Application()
+        app.router.add_get("/", ok)
+        app.router.add_get("/health", ok)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self.settings.health_port)
+        await site.start()
+        log.info("Health server listening on 0.0.0.0:%d", self.settings.health_port)
+        return runner
+
     async def run(self):
-        await self.dp.start_polling(self.bot)
+        runner = None
+        if self.settings.health_port > 0:
+            runner = await self._start_health_server()
+        try:
+            await self.dp.start_polling(self.bot)
+        finally:
+            if runner is not None:
+                await runner.cleanup()
 
 
 async def main():
