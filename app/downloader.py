@@ -15,6 +15,47 @@ LYRICS_API = "https://lrclib.net/api/get"
 YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
 IG_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
 X_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com", "mobile.x.com"}
+TWEET_RE = re.compile(r"/([^/]+)/status/(\d+)")
+
+
+def _fetch_twitter_media(url, job_dir, max_bytes):
+    """Fallback for X/Twitter photo & video tweets via public api.fxtwitter.com."""
+    import json as _json
+    parsed = urlparse(url.strip())
+    m = TWEET_RE.search(parsed.path)
+    if not m:
+        return None
+    user, tid = m.group(1), m.group(2)
+    api_url = f"https://api.fxtwitter.com/{user}/status/{tid}"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "spotify-telegram-bot"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = _json.loads(resp.read().decode("utf-8", errors="ignore"))
+    tweet = payload.get("tweet") or {}
+    media = tweet.get("media") or {}
+    title = (tweet.get("text") or f"@{user}")[:120]
+
+    photos = media.get("photos") or []
+    if photos:
+        paths = []
+        for idx, ph in enumerate(photos[:10], 1):
+            img_url = ph.get("url")
+            data = fetch_bytes(img_url)
+            if data and len(data) <= max_bytes:
+                out = job_dir / f"photo_{idx}.jpg"
+                out.write_bytes(data)
+                paths.append(out)
+        if paths:
+            return paths, title, "photo"
+
+    videos = media.get("videos") or []
+    if videos:
+        vid_url = videos[0].get("url")
+        data = fetch_bytes(vid_url, timeout=45)
+        if data and len(data) <= max_bytes:
+            out = job_dir / "video.mp4"
+            out.write_bytes(data)
+            return [out], title, "video"
+    return None
 
 
 def detect_media_platform(url):
@@ -279,12 +320,19 @@ class AudioDownloader:
         except Cancelled:
             raise
         except Exception as e:
+            if platform == "twitter":
+                try:
+                    fb = _fetch_twitter_media(url, job_dir, self.max_bytes)
+                    if fb:
+                        return fb
+                except Exception as fe:
+                    log.warning("FxTwitter fallback failed (%s): %s", url, fe)
             raise DownloadError(str(e))
 
         if output.stat().st_size > self.max_bytes:
             output.unlink(missing_ok=True)
             raise DownloadError(f"File exceeds {self.max_mb} MB Telegram limit")
-        return output, title, is_audio
+        return [output], title, ("audio" if is_audio else "video")
 
     def _search_candidates(self, query, target_sec, source, cookiefile=None):
         """Flat search (fast, avoids per-video fetches); return up to 3 URLs

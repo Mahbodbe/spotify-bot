@@ -15,6 +15,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
     Update,
 )
@@ -401,22 +402,35 @@ class SpotifyBot:
                 f"⏳ دارم {label} رو دانلود می‌کنم...",
                 reply_markup=cancel_keyboard(),
             )
-            path = None
+            paths = []
             try:
                 async with self.global_semaphore:
                     action = (ChatAction.UPLOAD_VOICE if mode == "audio"
                               else ChatAction.UPLOAD_VIDEO)
                     await self.bot.send_chat_action(message.chat.id, action)
-                    path, title, is_audio = await self.downloader.download_media(
+                    paths, title, kind = await self.downloader.download_media(
                         url, mode=mode, quality=quality, cancel_event=cancel_ev)
                 await status.edit_text("📤 فایل آماده‌ست؛ دارم می‌فرستم...")
                 cap = html.escape(title)[:MAX_CAPTION]
-                if is_audio:
+                if kind == "audio":
                     await message.answer_audio(
-                        FSInputFile(path), title=title, caption=f"🎵 {cap}")
+                        FSInputFile(paths[0]), title=title, caption=f"🎵 {cap}")
+                elif kind == "photo":
+                    if len(paths) == 1:
+                        await message.answer_photo(
+                            FSInputFile(paths[0]), caption=cap)
+                    else:
+                        group = [
+                            InputMediaPhoto(
+                                media=FSInputFile(p),
+                                caption=cap if i == 0 else None,
+                            )
+                            for i, p in enumerate(paths[:10])
+                        ]
+                        await message.answer_media_group(group)
                 else:
                     await message.answer_video(
-                        FSInputFile(path), caption=f"🎬 {cap}")
+                        FSInputFile(paths[0]), caption=f"🎬 {cap}")
                 await status.delete()
             except Cancelled:
                 await status.edit_text("❌ لغو شد.")
@@ -435,8 +449,8 @@ class SpotifyBot:
                 await status.edit_text("⚠️ یک خطای غیرمنتظره رخ داد؛ دوباره امتحان کن.")
             finally:
                 self._clear_cancel(user_id)
-                if isinstance(path, Path):
-                    shutil.rmtree(path.parent, ignore_errors=True)
+                if paths:
+                    shutil.rmtree(paths[0].parent, ignore_errors=True)
 
     # -- collection (playlist/album) --
     async def _handle_collection(self, message: Message, url, user_id):
